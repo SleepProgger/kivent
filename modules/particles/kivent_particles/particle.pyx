@@ -7,6 +7,7 @@ from kivent_core.systems.rotate_systems cimport RotateStruct2D
 from kivent_core.systems.color_systems cimport ColorStruct
 from kivent_core.systems.position_systems cimport PositionStruct2D
 from kivent_core.systems.scale_systems cimport ScaleStruct2D
+from kivent_core.systems.renderers cimport RenderStruct
 from kivent_core.systems.staticmemgamesystem cimport (StaticMemGameSystem, 
     MemComponent)
 from kivy.properties import (StringProperty, NumericProperty, ListProperty,
@@ -14,9 +15,239 @@ from kivy.properties import (StringProperty, NumericProperty, ListProperty,
 from kivy.factory import Factory
 from kivent_core.memory_handlers.zone cimport MemoryZone
 
+from kivent_core.rendering.model cimport VertexModel
+from kivent_core.managers.resource_managers cimport ModelManager, TextureManager
+from kivent_core.systems.renderers cimport RenderStruct, Renderer
+
 include "particle_math.pxi"
 include "particle_config.pxi"
     
+
+
+cdef class ParticleCacheBase:
+    '''
+    Interface for the particle cache.
+    Implement this if you need different caching behaviour.
+    '''
+    
+    def __init__(self, object gameworld):
+        self.gameworld = gameworld
+    
+    cdef short cache_particle(self, unsigned int entity_id,
+                            unsigned int components_index, unsigned int texkey,
+                            unsigned int tick) except -1:
+        '''
+        Caches a particle if space is available.
+        Returns a short interpretable as bint.
+        '''
+        raise NotImplementedError()
+    
+    cdef CachedParticleInfo get_particle(self, unsigned int texture_key,
+                                         unsigned int tick) except *:
+        '''
+        Returns a CachedParticleInfo with entity_id, components index
+        and 'require_texture_change'.
+        entity_id is set to <unsigned int>-1 if no particle is available.
+        
+        'require_texture_change' attribute indicates the texture
+        MIGHT be different from the requested one and need to be changed.
+        '''
+        raise NotImplementedError()
+    
+
+    cdef int get_particle_count(self) except -1:
+        ''' Return the sum of currently cached particles. '''
+        raise NotImplementedError()
+      
+    cdef do_maintenance_work(self, unsigned int tick):
+        '''
+        Implement your clean up code here if required.
+        This function will be called every X ticks
+        (defined by the ParticleSystem).
+        '''
+        pass
+    
+    cdef short remove_particle(self, unsigned int entity_id) except -1:
+        '''
+        Remove a particle from the cache and remove the entity
+        from the gameworld IF it was cached.
+        
+        Returns success as short interpretable as bint. 
+        '''
+        if self.remove_particle_from_cache(entity_id):
+            return 0
+        self.gameworld.entities_to_remove.append(entity_id)
+        return 1
+    
+    cdef short remove_particle_from_cache(self, unsigned int entity_id) except -1:
+        '''
+        Remove a particle from the cache.
+        Returns success as short interpretable as bint.
+        '''
+        raise NotImplementedError()
+    
+    def clean_all(self, bint remove_entity=1):
+        # TODO: remove all
+        '''
+        Deletes all cached particles.
+        Args:
+            remove_entity (bool): When true also remove the entities from the gameworld.
+        '''
+        raise NotImplementedError()
+    
+    cdef list import_particles(self, list particles, unsigned int tick):
+        '''
+        Imports particles.
+        Mostly used when changing the cache implementation. 
+        '''
+        cdef unsigned int texkey, entity_id, components_index
+        for texkey, entity_id, components_index in particles:
+            self.cache_particle(entity_id, components_index, texkey, tick)
+    
+    cdef tuple export_particles(self, bint do_clean):
+        '''
+        Export all cached particles.
+        Mostly used to change the used cache implementation.
+        
+        Returns a list of (texture_key, entity_id, components_index) tuples.
+        '''
+        raise NotImplementedError()
+    
+    def set_buffer_size(self, unsigned int value):
+        # TODO bla
+        raise NotImplementedError()
+    
+        
+    
+    
+
+cdef class SimpleParticleCache(ParticleCacheBase):
+    '''
+        This class caches currently unused particles.
+        It tries to minimizes the recycling costs by using a buffer per texture.
+        If no particle is available for the specified texture 
+        we return a random one.
+         
+        This class is only useable from cython.
+    '''
+     
+    def __init__(self, object gameworld, unsigned int buffer_size):
+        '''
+        TODO: docs
+        '''
+        super(SimpleParticleCache, self).__init__(gameworld)
+        self.buffer_size = buffer_size
+        self.texture_buffer = dict()
+        self.entity_buffer = dict()
+        self.available = 0
+        
+    cdef short cache_particle(self, unsigned int entity_id,
+                            unsigned int components_index, unsigned int texkey,
+                            unsigned int tick) except -1:
+        '''
+        Tries to cache a particle if space is available.
+
+        Return success as short interpretable as bint  
+        '''
+        cdef dict cur_cache        
+        if self.available >= self.buffer_size:
+            return 0
+        if texkey in self.texture_buffer:
+            self.texture_buffer[texkey][entity_id] = components_index
+        else:
+            self.texture_buffer[texkey] = {entity_id: components_index}
+        self.entity_buffer[entity_id] = texkey
+        self.available += 1
+        return 1
+     
+    cdef CachedParticleInfo get_particle(self, unsigned int texkey,
+                                         unsigned int tick) except *:
+        '''
+        Returns a CachedParticleInfo with the entity_id and components index.
+        The 'require_texture_change' attribute indicates if the texture
+        is different from the requested one and the caller need to update
+        it in the renderer.
+        
+        'entity_id' is set to <unsigned int>-1 if no particle is available.
+        '''
+        
+        cdef dict cur_cache
+        cdef unsigned int old_texkey
+        cdef unsigned int entity_id, components_index
+        cdef CachedParticleInfo ret
+        if self.available == 0:
+            ret.entity_id = <unsigned int>-1
+            return ret
+        if texkey in self.texture_buffer:
+            cur_cache = self.texture_buffer[texkey]
+            entity_id, components_index = cur_cache.popitem()
+            del self.entity_buffer[entity_id]
+            ret.require_texture_change = 0 
+        else:
+            entity_id, texkey = self.entity_buffer.popitem()
+            cur_cache = self.texture_buffer[texkey]
+            components_index = cur_cache.pop(entity_id)            
+            ret.require_texture_change = 1
+        if len(cur_cache) == 0:
+            del self.texture_buffer[texkey]
+        self.available -= 1
+        ret.entity_id = entity_id
+        ret.components_index = components_index
+        return ret
+    
+    cdef short remove_particle_from_cache(self, unsigned int entity_id) except -1:
+        '''
+        Remove a particle from the cache.
+        Returns a short interpretable as bint.
+        '''
+        cdef unsigned int texkey
+        if entity_id in self.entity_buffer:
+            texkey = self.entity_buffer.pop(entity_id)
+            del self.texture_buffer[texkey][entity_id]
+            if len(self.texture_buffer[texkey]) == 0:
+                del self.texture_buffer[texkey]
+            self.available -= 1 
+            return 1
+        return 0
+             
+    cdef int get_particle_count(self) except -1:
+        return self.available
+                
+    def clean_all(self, bint remove_entities=1):
+        '''
+        Deletes all cached particles.
+        Args:
+            remove_entity (bool): When true also remove the entities
+                                  from the gameworld.
+        '''
+        for k in self.entity_buffer:
+            if remove_entities:
+                self.remove_particle(k)
+            else:
+                self.remove_particle_from_cache(k)
+    
+    cdef tuple export_particles(self, bint do_clean):
+        '''
+        Export all cached particles.
+        Used to change the used cache implementation.
+        
+        Returns a list of (texture_key, entity_id, components_index) tuples. 
+        '''
+        cdef list ret = [(t, e, self.texture_buffer[t][e]) for e,t in self.entity_buffer.items()]
+        if do_clean:
+            self.texture_buffer = dict()
+            self.entity_buffer = dict()
+            self.available = 0
+        return ret
+    
+    def set_buffer_size(self, unsigned int value):
+        '''
+        Sets the global maximum of cached particles.
+        Cached particles are NOT removed when number of current particles
+        is set to > value.
+        '''
+        self.buffer_size = value
+
 
 cdef class ParticleComponent(MemComponent):
     '''The component associated with ParticleSystem
@@ -268,37 +499,106 @@ cdef class ParticleSystem(StaticMemGameSystem):
     component_type = ObjectProperty(ParticleComponent)
     processor = BooleanProperty(True)
     system_names = ListProperty(['particles','position', 'rotate', 'scale',
-        'color'])
+        'color', 'particle_renderer'])
     renderer_name = StringProperty('particle_renderer')
+    model_format = StringProperty('vertex_format_9f4ub')
     particle_zone = StringProperty('particles')
+    buffer_size = NumericProperty(0)
+    maintenance_delay = NumericProperty(60*10)
 
     def __init__(self, **kwargs):
         super(ParticleSystem, self).__init__(**kwargs)
         self._system_names = [x for x in self.system_names]
+        self._system_names[-1] = self.renderer_name
+        self.cache = SimpleParticleCache(self.gameworld, self.buffer_size)
+        self.tick = 0
 
     cdef unsigned int create_particle(self, ParticleEmitter emitter) except -1:
+        cdef unsigned int entity_id, real_index, components_count
+        cdef unsigned int groupkey
         cdef list system_names = self._system_names
         cdef str renderer_name = self.renderer_name
-        create_dict = {
-            system_names[0]: emitter,
-            system_names[1]: (0., 0.),
-            system_names[2]: 0.,
-            system_names[3]: 0.,
-            system_names[4]: (255, 255, 255, 255),
-            renderer_name: {'texture': emitter._texture},
-        }
-        create_order = [system_names[1], system_names[2], system_names[3], 
-                        system_names[4], system_names[0], renderer_name]
-        return self.gameworld.init_entity(create_dict, create_order, 
+        cdef RenderStruct* render_struct
+        cdef VertexModel old_model
+        cdef Renderer renderer
+        cdef bint same_batch
+        cdef void** component_data = <void**>(self.entity_components.memory_block.data)
+        cdef ModelManager model_manager = self.gameworld.model_manager
+        cdef TextureManager texture_manager = self.gameworld.texture_manager
+        cdef str model_name = self.model_format + '_' + emitter._texture
+        cdef unsigned int texkey = texture_manager.get_texkey_from_name(emitter._texture)
+        
+        # TODO: should be moved to emitter creation but that doesn't know the model_format?!
+        if not model_name in model_manager._models:
+            w, h = texture_manager.get_size(texkey)
+            model_manager.load_textured_rectangle(self.model_format,
+                w, h, emitter._texture, model_name, do_copy=False)
+            
+        cdef CachedParticleInfo particle = self.cache.get_particle(texkey, self.tick)
+        # We need to create a new particle entity
+        if particle.entity_id == <unsigned int>-1:
+            create_dict = {
+                system_names[0]: emitter,
+                system_names[1]: (0., 0.),
+                system_names[2]: 0.,
+                system_names[3]: 0.,
+                system_names[4]: (255, 255, 255, 255),
+                renderer_name: {'texture': emitter._texture,
+                                'model_key': model_name, 'copy': False},
+            }
+            create_order = [system_names[1], system_names[2], system_names[3], 
+                            system_names[4], renderer_name, system_names[0]]
+            return self.gameworld.init_entity(create_dict, create_order, 
             zone=self.particle_zone)
+            
+        # Use a cached particle
+        components_count = self.entity_components.count
+        real_index = particle.components_index * components_count
+        render_struct = <RenderStruct*>component_data[real_index+5]
+        entity_id = particle.entity_id
+        if particle.require_texture_change:
+            renderer = <Renderer>render_struct.renderer
+            old_model = <VertexModel>render_struct.model
+            model_manager.unregister_entity_with_model(
+                particle.entity_id, old_model._name)
+            groupkey = texture_manager.get_groupkey_from_texkey(render_struct.texkey)
+            same_batch = texture_manager.get_texkey_in_group(texkey, groupkey)
+            render_struct.model = <void*>model_manager._models[model_name]
+            if not same_batch:
+                renderer._unbatch_entity(entity_id, render_struct)
+            render_struct.texkey = texkey
+            if not same_batch:
+                renderer._batch_entity(entity_id, render_struct)
+            model_manager.register_entity_with_model(
+                particle.entity_id, self.renderer_name, model_name)
+            
+        self._init_component(particle.components_index, entity_id,
+                              self.particle_zone, emitter)
+        render_struct.render = 1
+        return entity_id
+            
 
     def on_system_names(self, instance, value):
         self._system_names = [x for x in value]
+        self._system_names[-1] = self.renderer_name
+                
+    def on_renderer_name(self, instance, value):
+        self._system_names[-1] = value
+        
+    def on_buffer_size(self, instance, value):
+        self.cache.set_buffer_size(value)
 
-    def init_component(self, unsigned int component_index, 
+    def change_particle_cache(self, ParticleCacheBase cache):
+        cdef list data = self.cache.export_particles(do_clean=True)
+        cache.set_buffer_size(self.buffer_size)
+        cache.import_particles(data, self.tick)
+        self.cache = cache
+
+    def _init_component(self, unsigned int components_index, 
         unsigned int entity_id, str zone, ParticleEmitter emitter):
         '''
         Args:
+            components_index: The index of the components used for this entiy
             emitter (ParticleEmitter): The emitter the particle is coming from.
 
         The initialization arg for a ParticleComponent is just the
@@ -306,11 +606,26 @@ cdef class ParticleSystem(StaticMemGameSystem):
         initialize a particle yourself, instead EmitterSystem will call
         ParticleSystem.create_particle (a cdef'd function).
         '''
-        cdef MemoryZone memory_zone = self.imz_components.memory_zone
-        cdef ParticleStruct* pointer = <ParticleStruct*>memory_zone.get_pointer(
-            component_index)
+        cdef void** component_data = <void**>(
+            self.entity_components.memory_block.data)
+        cdef unsigned int component_count = self.entity_components.count
+        cdef unsigned int real_index = components_index * component_count
+        cdef ParticleStruct* pointer = <ParticleStruct*>component_data[
+            real_index+0]
+        cdef PositionStruct2D* pos_comp = <PositionStruct2D*>component_data[
+            real_index+1]
+        cdef RotateStruct2D* rotate_comp = <RotateStruct2D*>component_data[
+            real_index+2]
+        cdef ScaleStruct2D* scale_comp = <ScaleStruct2D*>component_data[
+            real_index+3]
+        cdef ColorStruct* color_comp = <ColorStruct*>component_data[
+            real_index+4]
+        cdef RenderStruct* render_comp = <RenderStruct*>component_data[
+            real_index+5]
+        render_comp.render = 1
         pointer.entity_id = entity_id
         pointer.emitter = <void*>emitter
+        pointer.is_alive = 1
         pointer.current_time = 0.0
         pointer.start_pos[0] = emitter._pos[0]
         pointer.start_pos[1] = emitter._pos[1]
@@ -355,21 +670,6 @@ cdef class ParticleSystem(StaticMemGameSystem):
         cdef float end_rotation = random_variance(emitter._end_rotation, 
             emitter._end_rotation_variance)
         pointer.rotation_delta = (end_rotation - start_rotation) / life_span
-
-        cdef unsigned int ent_comps_ind = self.entity_components.add_entity(
-            entity_id, zone)
-        cdef void** component_data = <void**>(
-            self.entity_components.memory_block.data)
-        cdef unsigned int component_count = self.entity_components.count
-        cdef unsigned int real_index = ent_comps_ind * component_count
-        cdef PositionStruct2D* pos_comp = <PositionStruct2D*>component_data[
-            real_index+1]
-        cdef RotateStruct2D* rotate_comp = <RotateStruct2D*>component_data[
-            real_index+2]
-        cdef ScaleStruct2D* scale_comp = <ScaleStruct2D*>component_data[
-            real_index+3]
-        cdef ColorStruct* color_comp = <ColorStruct*>component_data[
-            real_index+4]
  
         #write scale, color, position, and rotate data to components
         if emitter._emitter_type == 0:
@@ -390,11 +690,17 @@ cdef class ParticleSystem(StaticMemGameSystem):
             pointer.color[i] = <float>start_color[i]
             color_comp.color[i] = start_color[i]
 
+    def init_component(self, unsigned int component_index, 
+        unsigned int entity_id, str zone, ParticleEmitter emitter):
+        cdef unsigned int ent_comps_ind = self.entity_components.add_entity(entity_id, zone)
+        self._init_component(ent_comps_ind, entity_id, zone, emitter)
+
     def remove_component(self, unsigned int component_index):
         cdef MemoryZone memory_zone = self.imz_components.memory_zone
         cdef ParticleStruct* pointer = <ParticleStruct*>memory_zone.get_pointer(
             component_index)
         self.entity_components.remove_entity(pointer.entity_id)
+        self.cache.remove_particle_from_cache(pointer.entity_id)
         super(ParticleSystem, self).remove_component(component_index)
 
     def clear_component(self, unsigned int component_index):
@@ -445,14 +751,22 @@ cdef class ParticleSystem(StaticMemGameSystem):
         cdef RotateStruct2D* rotate_comp
         cdef ScaleStruct2D* scale_comp
         cdef ColorStruct* color_comp
+        cdef RenderStruct* render_comp
+
+        cdef unsigned int tick
+        self.tick = tick = self.tick + 1
+        if tick % self.maintenance_delay == 0:
+            self.cache.do_maintenance_work(tick)
 
         gameworld = self.gameworld
-        remove_entity = gameworld.remove_entity
+        remove_entity = self.gameworld.entities_to_remove.append
         for i in range(count):
             real_index = i*component_count
             if component_data[real_index] == NULL:
                 continue
             particle_comp = <ParticleStruct*>component_data[real_index]
+            if not particle_comp.is_alive:
+                continue
             pos_comp = <PositionStruct2D*>component_data[real_index+1]
             rotate_comp = <RotateStruct2D*>component_data[real_index+2]
             scale_comp = <ScaleStruct2D*>component_data[real_index+3]
@@ -511,8 +825,14 @@ cdef class ParticleSystem(StaticMemGameSystem):
             color_copy(particle_comp.color, color_comp.color)
             if particle_comp.current_time >= particle_comp.total_time:
                 emitter._current_particles -= 1
-                emitter.active_particles.remove(particle_comp.entity_id)
-                remove_entity(particle_comp.entity_id)
+                render_comp = <RenderStruct*>component_data[real_index+5]
+                particle_comp.is_alive = 0
+                if self.cache.cache_particle(particle_comp.entity_id, i,
+                                             render_comp.texkey, tick):
+                    render_comp.render = 0
+                else:
+                    emitter.active_particles.remove(particle_comp.entity_id)
+                    remove_entity(particle_comp.entity_id)
 
 
 
