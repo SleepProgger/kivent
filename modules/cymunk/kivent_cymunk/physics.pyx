@@ -471,13 +471,10 @@ cdef class CymunkPhysics(StaticMemGameSystem):
             if 'group' in shape:
                 new_shape.group = shape['group']
             if 'layers' in shape:
-                print "layers is", shape['layers']
                 if isinstance(shape['layers'], int):
-                    print "is int"
                     layers = int(shape['layers'])
                 else:
                     layers = self.layers.calculate_layerset(shape['layers'])
-                    print "calculated layer nr for %s: %i" % (shape['layers'], layers)
                 new_shape.layers = layers
             shapes.append(new_shape)
             space.add(new_shape)
