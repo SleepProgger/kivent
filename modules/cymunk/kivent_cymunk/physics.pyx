@@ -19,6 +19,7 @@ from kivent_core.memory_handlers.block cimport MemoryBlock
 from kivent_core.memory_handlers.zone cimport MemoryZone
 from kivent_core.memory_handlers.indexing cimport IndexedMemoryZone
 from kivent_core.managers.system_manager cimport SystemManager
+from collections import Iterable
 
 
 cdef class PhysicsComponent(MemComponent):
@@ -471,10 +472,10 @@ cdef class CymunkPhysics(StaticMemGameSystem):
             if 'group' in shape:
                 new_shape.group = shape['group']
             if 'layers' in shape:
-                if isinstance(shape['layers'], int):
-                    layers = int(shape['layers'])
-                else:
+                if isinstance(shape['layers'], Iterable):
                     layers = self.layers.calculate_layerset(shape['layers'])
+                else:
+                    layers = int(shape['layers'])
                 new_shape.layers = layers
             shapes.append(new_shape)
             space.add(new_shape)
